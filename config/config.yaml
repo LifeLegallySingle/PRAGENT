@@ -1,7 +1,7 @@
 # Example configuration for the PR Agent Swarm. Values may be overridden
 # by environment variables defined in a `.env` file.
 
-search_provider: ${SEARCH_PROVIDER:mock}
+search_provider: ${SEARCH_PROVIDER:serpapi}
 serpapi_api_key: ${SERP_API_KEY:}
 openai_api_key: ${OPENAI_API_KEY:}
 search_rate_limit: ${SEARCH_RATE_LIMIT:60}
