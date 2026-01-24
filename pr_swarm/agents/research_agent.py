@@ -7,18 +7,19 @@ New behavior: find the writer's most recent relevant piece and extract:
   - the gap / unanswered question
   - an explicit *required opening line* anchor for the pitch
 
-CRITICAL FIX:
-- Aligns article search with the real SerpAPI client instead of calling a non-existent interface
-- Prevents fabricated article context when no real piece is found
+CRITICAL FIXES (Brain v2):
+- Performs real article search even when injected client does not implement `.search()`
+- Never fabricates an article title; if no real result -> NEEDS_RESEARCH
+- Marks confidence HIGH when a real, citable article is found (supports deterministic mode)
 """
 
 from __future__ import annotations
 
 import json
 import re
-import requests
 from typing import Any, Dict, List, Optional
 
+import requests
 from pydantic import ValidationError
 
 from pr_swarm.schemas.latest_piece_analysis import LatestPieceAnalysis
@@ -44,18 +45,18 @@ def _search_articles(
     query: str,
     num_results: int,
 ) -> List[Dict[str, Any]]:
-    """
-    Execute a real article search.
+    """Execute a real article search.
 
     Supports:
-    - search_client.search(query, num_results)
-    - direct SerpAPI call via search_client.api_key
+    - search_client.search(query, num_results)  (if available)
+    - direct SerpAPI call via search_client.api_key (compat with SerpApiSearchClient)
     """
-    # Case 1: expected interface exists
     if hasattr(search_client, "search"):
-        return search_client.search(query=query, num_results=num_results) or []
+        try:
+            return search_client.search(query=query, num_results=num_results) or []
+        except Exception:
+            return []
 
-    # Case 2: fallback to direct SerpAPI usage
     api_key = getattr(search_client, "api_key", None)
     if not api_key:
         return []
@@ -75,7 +76,6 @@ def _search_articles(
 
     data = response.json()
     results: List[Dict[str, Any]] = []
-
     for r in data.get("organic_results", [])[:num_results]:
         results.append(
             {
@@ -85,7 +85,6 @@ def _search_articles(
                 "snippet": r.get("snippet"),
             }
         )
-
     return results
 
 
@@ -93,6 +92,8 @@ def _heuristic_from_results(
     results: List[Dict[str, Any]],
     prospect_name: str,
 ) -> LatestPieceAnalysis:
+    """Deterministic extractor from SerpAPI organic results."""
+
     if not results:
         return LatestPieceAnalysis(
             title="N/A",
@@ -113,8 +114,10 @@ def _heuristic_from_results(
     r0 = results[0]
     title = _clean(r0.get("title", ""))
     snippet = _clean(r0.get("snippet", ""))
-    url = r0.get("link") or "N/A"
-    publisher = _clean(r0.get("source") or "N/A")
+    url = (r0.get("link") or r0.get("url") or "").strip() or "N/A"
+    publisher = _clean(r0.get("source") or r0.get("publisher") or "N/A")
+
+    has_real_anchor = bool(title) and url != "N/A" and publisher.upper() != "N/A"
 
     return LatestPieceAnalysis(
         title=title or "N/A",
@@ -128,11 +131,11 @@ def _heuristic_from_results(
         why_life_legally_single_fits="Extends the conversation with a singles-first lens",
         required_opening_anchor=(
             f'Hi {prospect_name} — I just read your recent piece "{title}" and had a follow-up idea.'
-            if title
+            if has_real_anchor
             else "NEEDS_RESEARCH"
         ),
-        confidence="medium" if title else "low",
-        failure_reason=None if title else "Article snippet/title missing",
+        confidence="high" if has_real_anchor else "low",
+        failure_reason=None if has_real_anchor else "Missing title/url/publisher in search results; cannot anchor safely.",
         key_evidence_bullets=[snippet[:120]] if snippet else [],
     )
 
@@ -153,16 +156,10 @@ def find_latest_piece_analysis(
         query_parts.append(outlet)
     if beat_keywords:
         query_parts.append(" ".join(beat_keywords[:6]))
+    query = " ".join([p for p in query_parts if p])
 
-    query = " ".join(query_parts)
+    results = _search_articles(search_client=search_client, query=query, num_results=num_results)
 
-    results = _search_articles(
-        search_client=search_client,
-        query=query,
-        num_results=num_results,
-    )
-
-    # Deterministic mode (no LLM)
     if llm is None:
         return _heuristic_from_results(results, prospect_name)
 
