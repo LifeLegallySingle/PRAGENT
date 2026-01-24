@@ -156,7 +156,7 @@ def main() -> None:
     )
 
     discovery_agent = DiscoveryAgent(search_client)
-    research_agent = ResearchAgent(search_client=search_client)
+    research_agent = ResearchAgent()  # ✅ FIXED: no injected search_client
     pitch_agent = PitchDraftingAgent(brand_config=config.get("brand", {}))
 
     concurrency = int(config.get("concurrency", 4))
