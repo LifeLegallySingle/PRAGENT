@@ -1,13 +1,10 @@
 """
 CLI entrypoint for running the PR Agent Swarm.
 
-Usage example:
-
-    python -m pr_swarm.run --prospects data/prospects.csv --out outputs/ --limit 20
-
-This script loads configuration from a YAML file (default ``config/config.yaml``),
-reads a CSV of journalist prospects, and orchestrates the discovery,
-research, and pitch drafting agents using Prefect.
+Brain v2–compliant runner:
+- Uses workflow-enforced validation
+- Blocks pitch generation without real article research
+- Safely handles NEEDS_RESEARCH outcomes
 """
 
 from __future__ import annotations
@@ -24,7 +21,8 @@ from .config import load_config
 from .utils.logging_setup import setup_logging
 from .utils.search_client import get_search_client
 from .agents import DiscoveryAgent, ResearchAgent, PitchDraftingAgent
-from .orchestrator import process_prospect
+from .orchestrator.workflow import process_prospect
+from .orchestrator.angle_builder import AngleBuilder
 from .schemas.models import Prospect, RunManifest
 
 
@@ -41,6 +39,7 @@ async def process_all_prospects(
     prospects: List[Prospect],
     discovery_agent: DiscoveryAgent,
     research_agent: ResearchAgent,
+    angle_builder: AngleBuilder,
     pitch_agent: PitchDraftingAgent,
     out_dir: Path,
     concurrency: int,
@@ -64,6 +63,7 @@ async def process_all_prospects(
                     prospect=prospect,
                     discovery_agent=discovery_agent,
                     research_agent=research_agent,
+                    angle_builder=angle_builder,
                     pitch_agent=pitch_agent,
                 )
 
@@ -71,7 +71,34 @@ async def process_all_prospects(
                 notes = result["notes"]
                 pitch = result["pitch"]
 
-                # Write pitch markdown
+                # --- RESEARCH CSV (always written) ---
+                citations = profile.citations + notes.citations if profile.citations or notes.citations else []
+                citations_str = ";".join([c.url for c in citations])
+
+                research_rows.append([
+                    prospect.name,
+                    profile.matched_name,
+                    profile.email,
+                    profile.publication,
+                    profile.profile_url,
+                    "",
+                    getattr(notes, "thesis_one_liner", ""),
+                    "",
+                    citations_str,
+                ])
+
+                # --- PITCH OUTPUT (only if pitch is valid) ---
+                if isinstance(pitch, dict) and pitch.get("status") == "NEEDS_RESEARCH":
+                    pitch_rows.append([
+                        prospect.name,
+                        "",
+                        "",
+                        "",
+                        pitch.get("reason", ""),
+                    ])
+                    manifest.record_error(prospect.name, "needs_research", pitch.get("reason"))
+                    return
+
                 pitch_path = pitches_dir / f"{pitch.slug}.md"
                 with pitch_path.open("w", encoding="utf-8") as f:
                     f.write(f"# {pitch.subject_line}\n\n")
@@ -85,21 +112,6 @@ async def process_all_prospects(
                     pitch.subject_line,
                     pitch.body[:200].replace("\n", " ") + "...",
                     "",
-                ])
-
-                citations = profile.citations + notes.citations if profile.citations or notes.citations else []
-                citations_str = ";".join([c.url for c in citations])
-
-                research_rows.append([
-                    prospect.name,
-                    profile.matched_name,
-                    profile.email,
-                    profile.publication,
-                    profile.profile_url,
-                    ";".join(notes.topics) if notes.topics else "",
-                    notes.summary,
-                    ";".join(notes.angles),
-                    citations_str,
                 ])
 
                 results.append(result)
@@ -148,7 +160,7 @@ def main() -> None:
     if args.limit and args.limit > 0:
         prospects = prospects[: args.limit]
 
-    # Instantiate search client and agents
+    # --- Agents (Brain v2) ---
     search_client = get_search_client(
         provider=config.get("search_provider", "mock"),
         api_key=config.get("serpapi_api_key"),
@@ -156,7 +168,8 @@ def main() -> None:
     )
 
     discovery_agent = DiscoveryAgent(search_client)
-    research_agent = ResearchAgent()  # ✅ FIXED: no injected search_client
+    research_agent = ResearchAgent()
+    angle_builder = AngleBuilder()
     pitch_agent = PitchDraftingAgent(brand_config=config.get("brand", {}))
 
     concurrency = int(config.get("concurrency", 4))
@@ -166,6 +179,7 @@ def main() -> None:
             prospects,
             discovery_agent,
             research_agent,
+            angle_builder,
             pitch_agent,
             out_dir,
             concurrency,
