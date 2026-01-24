@@ -1,62 +1,83 @@
-"""Prefect flows orchestrating the PR Agent Swarm.
+"""Primary orchestration workflow for PRAGENT.
 
-The orchestrator defines three primary tasks—discovery, research, and pitch
-drafting—and composes them into a simple sequential flow per prospect. Tasks
-automatically retry on failure with exponential backoff. Higher‑level flows
-can be built on top of these primitives to process many prospects concurrently.
-
-Using Prefect as the orchestration framework makes it easy to add
-observability, concurrency controls, and scheduling in the future.
+Brain v2 enforcement:
+- Discovery identifies the writer
+- Research MUST find a real article
+- Validation MUST pass before angle or pitch generation
+- No validation pass → NO pitch
 """
 
-from __future__ import annotations
+from typing import Dict, Any
 
-from typing import Any, Dict
-
-from prefect import flow, task
-
-from ..agents import DiscoveryAgent, PitchDraftingAgent, ResearchAgent
-from ..schemas.models import JournalistProfile, Prospect, ResearchNotes
+from pr_swarm.orchestrator.validation import validate_anchor, validate_angle
+from pr_swarm.schemas.latest_piece_analysis import LatestPieceAnalysis
+from pr_swarm.schemas.primary_angle import PrimaryAngle
 
 
-@task(name="discovery", retries=2, retry_delay_seconds=2)
-async def run_discovery(prospect: Prospect, discovery_agent: DiscoveryAgent) -> JournalistProfile:
-    """Prefect task wrapping the discovery agent."""
-    return await discovery_agent.run(prospect)
-
-
-@task(name="research", retries=2, retry_delay_seconds=2)
-async def run_research(
-    prospect: Prospect,
-    profile: JournalistProfile,
-    research_agent: ResearchAgent,
-) -> ResearchNotes:
-    """Prefect task wrapping the research agent."""
-    return await research_agent.run(prospect, profile)
-
-
-@task(name="pitch", retries=2, retry_delay_seconds=2)
-async def run_pitch(
-    prospect: Prospect,
-    notes: ResearchNotes,
-    pitch_agent: PitchDraftingAgent,
-) -> Any:
-    """Prefect task wrapping the pitch drafting agent.
-
-    Returns a :class:`PitchDraft` instance.
-    """
-    return await pitch_agent.run(prospect, notes)
-
-
-@flow(name="process_prospect")
 async def process_prospect(
-    prospect: Prospect,
-    discovery_agent: DiscoveryAgent,
-    research_agent: ResearchAgent,
-    pitch_agent: PitchDraftingAgent,
+    *,
+    prospect,
+    discovery_agent,
+    research_agent,
+    angle_builder,
+    pitch_agent,
 ) -> Dict[str, Any]:
-    """Prefect flow that processes a single prospect through all three agents."""
-    profile = await run_discovery(prospect, discovery_agent)
-    notes = await run_research(prospect, profile, research_agent)
-    pitch = await run_pitch(prospect, notes, pitch_agent)
-    return {"profile": profile, "notes": notes, "pitch": pitch}
+    """
+    Execute the Brain v2 pipeline for a single prospect.
+
+    HARD RULE:
+    No validated article anchor → stop immediately.
+    """
+
+    # 1. Discovery — establish writer identity
+    profile = await discovery_agent.run(prospect)
+
+    # 2. Research — find latest real article
+    latest_piece: LatestPieceAnalysis = await research_agent.run(
+        prospect=prospect,
+        profile=profile,
+    )
+
+    # 3. Validate article anchor (Brain v2 gate)
+    anchor_check = validate_anchor(latest_piece)
+    if not anchor_check.ok:
+        return {
+            "profile": profile,
+            "notes": latest_piece,
+            "pitch": {
+                "status": "NEEDS_RESEARCH",
+                "reason": anchor_check.reason,
+            },
+        }
+
+    # 4. Build angle (only after valid article)
+    angle: PrimaryAngle = await angle_builder.run(
+        prospect=prospect,
+        latest_piece=latest_piece,
+        profile=profile,
+    )
+
+    angle_check = validate_angle(angle)
+    if not angle_check.ok:
+        return {
+            "profile": profile,
+            "notes": latest_piece,
+            "pitch": {
+                "status": "NEEDS_RESEARCH",
+                "reason": angle_check.reason,
+            },
+        }
+
+    # 5. Draft pitch (only after all validation passes)
+    pitch = await pitch_agent.run(
+        prospect=prospect,
+        latest_piece=latest_piece,
+        angle=angle,
+        profile=profile,
+    )
+
+    return {
+        "profile": profile,
+        "notes": latest_piece,
+        "pitch": pitch,
+    }
