@@ -60,6 +60,7 @@ class ResearchAgent:
             response = requests.get(
                 self.SERP_ENDPOINT,
                 params={
+                    "engine": "google",  # ✅ REQUIRED by SerpAPI
                     "q": query,
                     "api_key": self.serp_api_key,
                     "num": 5,
@@ -112,7 +113,11 @@ class ResearchAgent:
                 required_opening_anchor="",
             )
 
-        self.logger.debug("Research completed for %s (confidence=%s)", prospect.name, getattr(analysis, "confidence", "low"))
+        self.logger.debug(
+            "Research completed for %s (confidence=%s)",
+            prospect.name,
+            getattr(analysis, "confidence", "low"),
+        )
         return analysis
 
 
